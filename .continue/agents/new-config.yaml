@@ -1,0 +1,12 @@
+name: Abhi-Nexus Config
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Llama 3
+    provider: ollama
+    model: llama3:latest
+
+mcpServers:
+  - name: abhi-nexus
+    url: http://192.168.4.46:7070/sse

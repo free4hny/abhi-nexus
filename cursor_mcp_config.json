@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "abhi-nexus": {
+      "url": "http://192.168.4.46:7070/sse"
+    }
+  }
+}
