@@ -28,3 +28,5 @@ fastmcp==2.0.0
 
 # Shared
 numpy==1.26.4
+
+pip-audit

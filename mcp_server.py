@@ -291,6 +291,254 @@ def status_resource() -> str:
     return json.dumps(get_pipeline_status(), indent=2)
 
 
+
+"""
+Security Scanning Tools for Abhi-Nexus MCP Server
+===================================================
+Add these tools to your existing mcp_server.py file.
+
+Also add to requirements.txt:
+    pip-audit
+
+And install inside Docker:
+    docker exec abhi-nexus pip install pip-audit
+"""
+
+import json
+import re
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+
+# ── TOOL 8: Scan for vulnerable dependencies ──────────────────────────────────
+@mcp.tool()
+def scan_vulnerabilities(target: str = "all") -> dict:
+    """
+    Scan Abhi-Nexus for security vulnerabilities.
+
+    Args:
+        target: What to scan:
+                "dependencies" — check Python packages against CVE database
+                "secrets"      — scan code for hardcoded API keys or passwords
+                "all"          — run both scans (default)
+
+    Returns a report of any vulnerabilities found.
+    """
+    results = {
+        "scanned_at": datetime.now().isoformat(),
+        "target": target,
+        "dependency_scan": None,
+        "secrets_scan": None,
+        "summary": {}
+    }
+
+    if target in ("dependencies", "all"):
+        results["dependency_scan"] = _scan_dependencies()
+
+    if target in ("secrets", "all"):
+        results["secrets_scan"] = _scan_secrets()
+
+    # Build summary
+    dep_vulns = len(results["dependency_scan"].get("vulnerabilities", [])) if results["dependency_scan"] else 0
+    secret_hits = len(results["secrets_scan"].get("findings", [])) if results["secrets_scan"] else 0
+
+    results["summary"] = {
+        "vulnerable_packages": dep_vulns,
+        "secret_exposures": secret_hits,
+        "overall_status": "CRITICAL" if (dep_vulns + secret_hits) > 0 else "CLEAN",
+        "recommendation": _get_recommendation(dep_vulns, secret_hits)
+    }
+
+    return results
+
+
+def _scan_dependencies() -> dict:
+    """Run pip-audit against installed packages."""
+    try:
+        result = subprocess.run(
+            ["pip-audit", "--format", "json", "--progress-spinner", "off"],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        # pip-audit returns exit code 1 if vulnerabilities found — that's fine
+        output = result.stdout.strip()
+        if not output:
+            return {"status": "error", "message": "pip-audit returned no output", "vulnerabilities": []}
+
+        data = json.loads(output)
+        vulnerabilities = []
+
+        for dep in data.get("dependencies", []):
+            for vuln in dep.get("vulns", []):
+                vulnerabilities.append({
+                    "package": dep.get("name"),
+                    "installed_version": dep.get("version"),
+                    "vulnerability_id": vuln.get("id"),
+                    "description": vuln.get("description", "")[:200],
+                    "fix_versions": vuln.get("fix_versions", []),
+                    "severity": _estimate_severity(vuln.get("id", ""))
+                })
+
+        return {
+            "status": "complete",
+            "packages_scanned": len(data.get("dependencies", [])),
+            "vulnerable_count": len(vulnerabilities),
+            "vulnerabilities": vulnerabilities
+        }
+
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "message": "pip-audit timed out after 120 seconds", "vulnerabilities": []}
+    except FileNotFoundError:
+        return {"status": "error", "message": "pip-audit not installed. Run: pip install pip-audit", "vulnerabilities": []}
+    except json.JSONDecodeError as e:
+        return {"status": "error", "message": f"Could not parse pip-audit output: {e}", "vulnerabilities": []}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "vulnerabilities": []}
+
+
+def _scan_secrets() -> dict:
+    """Scan Python files for hardcoded secrets."""
+    # Patterns that look like hardcoded secrets
+    secret_patterns = [
+        (r'sk-[a-zA-Z0-9]{32,}', "OpenAI API key"),
+        (r'sk-proj-[a-zA-Z0-9_\-]{32,}', "OpenAI project key"),
+        (r'ghp_[a-zA-Z0-9]{36}', "GitHub personal access token"),
+        (r'xoxb-[0-9]+-[a-zA-Z0-9]+', "Slack bot token"),
+        (r'AKIA[0-9A-Z]{16}', "AWS access key"),
+        (r'password\s*=\s*["\'][^"\']{6,}["\']', "Hardcoded password"),
+        (r'api_key\s*=\s*["\'][^"\']{8,}["\']', "Hardcoded API key"),
+        (r'secret\s*=\s*["\'][^"\']{8,}["\']', "Hardcoded secret"),
+        (r'Bearer\s+[a-zA-Z0-9_\-\.]{20,}', "Bearer token"),
+    ]
+
+    # Files to skip — these legitimately reference secret variable names
+    skip_patterns = ["mcp_server.py", ".env", "__pycache__", ".git", "node_modules"]
+
+    app_dir = BASE_DIR
+    findings = []
+
+    try:
+        python_files = list(app_dir.rglob("*.py")) + list(app_dir.rglob("*.yml")) + list(app_dir.rglob("*.yaml"))
+
+        for filepath in python_files:
+            # Skip certain files
+            if any(skip in str(filepath) for skip in skip_patterns):
+                continue
+
+            try:
+                content = filepath.read_text(encoding="utf-8", errors="ignore")
+                lines = content.splitlines()
+
+                for line_num, line in enumerate(lines, 1):
+                    # Skip lines that use environment variables — these are safe
+                    if "os.environ" in line or "os.getenv" in line or "${" in line or ".env" in line.lower():
+                        continue
+                    # Skip comment lines
+                    if line.strip().startswith("#"):
+                        continue
+
+                    for pattern, secret_type in secret_patterns:
+                        if re.search(pattern, line, re.IGNORECASE):
+                            findings.append({
+                                "file": str(filepath.relative_to(app_dir)),
+                                "line": line_num,
+                                "type": secret_type,
+                                "severity": "HIGH",
+                                "recommendation": "Move to .env file and load with python-dotenv"
+                            })
+                            break  # One finding per line
+
+            except Exception:
+                continue
+
+        return {
+            "status": "complete",
+            "files_scanned": len(python_files),
+            "findings_count": len(findings),
+            "findings": findings
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e), "findings": []}
+
+
+def _estimate_severity(vuln_id: str) -> str:
+    """Estimate severity from vulnerability ID prefix."""
+    vuln_id = vuln_id.upper()
+    if "CRITICAL" in vuln_id:
+        return "CRITICAL"
+    if vuln_id.startswith("CVE"):
+        return "HIGH"  # Conservative — treat all CVEs as high
+    if "PYSEC" in vuln_id:
+        return "MEDIUM"
+    return "UNKNOWN"
+
+
+def _get_recommendation(dep_vulns: int, secret_hits: int) -> str:
+    if dep_vulns == 0 and secret_hits == 0:
+        return "No issues found. Keep dependencies updated regularly."
+    parts = []
+    if dep_vulns > 0:
+        parts.append(f"Update {dep_vulns} vulnerable package(s) immediately.")
+    if secret_hits > 0:
+        parts.append(f"Move {secret_hits} hardcoded secret(s) to .env file.")
+    return " ".join(parts)
+
+
+# ── TOOL 9: Get upgrade recommendations ───────────────────────────────────────
+@mcp.tool()
+def get_upgrade_recommendations() -> dict:
+    """
+    Check all installed packages and recommend which ones to upgrade.
+    Shows current version vs latest available version.
+    Useful for keeping Abhi-Nexus dependencies fresh and secure.
+    """
+    try:
+        result = subprocess.run(
+            ["pip", "list", "--outdated", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode != 0:
+            return {"status": "error", "message": result.stderr}
+
+        outdated = json.loads(result.stdout)
+
+        # Flag security-critical packages
+        security_critical = {"openai", "fastapi", "uvicorn", "pydantic", "cryptography",
+                              "python-jose", "passlib", "bcrypt", "requests", "httpx"}
+
+        packages = []
+        for pkg in outdated:
+            name = pkg.get("name", "").lower()
+            packages.append({
+                "package": pkg.get("name"),
+                "current": pkg.get("version"),
+                "latest": pkg.get("latest_version"),
+                "priority": "HIGH — security critical" if name in security_critical else "NORMAL",
+                "upgrade_command": f"pip install {pkg.get('name')}=={pkg.get('latest_version')}"
+            })
+
+        # Sort — security critical first
+        packages.sort(key=lambda x: 0 if "HIGH" in x["priority"] else 1)
+
+        return {
+            "status": "complete",
+            "total_outdated": len(packages),
+            "security_critical_outdated": sum(1 for p in packages if "HIGH" in p["priority"]),
+            "packages": packages,
+            "checked_at": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Starting Abhi-Nexus MCP Server...")

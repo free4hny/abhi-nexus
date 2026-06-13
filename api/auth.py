@@ -9,7 +9,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "abhi-nexus-secret-2026")
+# Load secrets from environment variables - these MUST be set
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable must be set. Copy .env.example to .env and configure it.")
+
 ALGORITHM = "HS256"
 TOKEN_EXPIRY_HOURS = 24
 
@@ -17,8 +21,11 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 def _make_users() -> dict:
-    admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
-    viewer_password = os.getenv("VIEWER_PASSWORD", "viewer123")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    viewer_password = os.getenv("VIEWER_PASSWORD")
+    
+    if not admin_password or not viewer_password:
+        raise ValueError("ADMIN_PASSWORD and VIEWER_PASSWORD environment variables must be set. Copy .env.example to .env and configure it.")
     return {
         "abhi": {
             "username": "abhi",
